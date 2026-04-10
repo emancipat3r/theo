@@ -70,6 +70,7 @@ type HostResult struct {
 	Status     string            `json:"status"`
 	Verdict    string            `json:"verdict"`
 	RootMethod string            `json:"root_method"`
+	Duration   string            `json:"duration"`
 	Findings   []Finding         `json:"findings"`
 	Containers []ContainerResult `json:"containers,omitempty"`
 	Error      string            `json:"error,omitempty"`
@@ -111,6 +112,7 @@ var defaultSeverity = map[string]Severity{
 	"NETNS":        SevInfo,
 	"CONTAINERENV": SevInfo,
 	"TAINTED":      SevInfo,
+	"SGIDDIR":      SevInfo,
 	"HISTORY":      SevInfo,
 	"SHADOWPERMS":  SevInfo,
 
@@ -140,12 +142,41 @@ var dangerousCaps = map[string]bool{
 	"NET_ADMIN": true,
 }
 
+// Kernel taint bit descriptions (from kernel docs)
+var taintFlags = map[int]string{
+	0:  "proprietary module",
+	1:  "module force-loaded",
+	2:  "kernel is SMP but CPU not designed for SMP",
+	3:  "module force-unloaded",
+	4:  "MCE (machine check exception)",
+	5:  "bad page referenced",
+	6:  "user request via sysrq",
+	7:  "ACPI table overridden",
+	8:  "kernel issued warning",
+	9:  "staging driver loaded",
+	10: "workaround for platform firmware bug applied",
+	11: "externally-built (out-of-tree) module loaded",
+	12: "unsigned module loaded",
+	13: "soft lockup occurred",
+	14: "kernel live-patched",
+	15: "auxiliary taint (distro-defined)",
+	16: "randstruct plugin randomized layout",
+	17: "in-kernel test module loaded",
+}
+
 // ---------------------------------------------------------------------------
 // Analysis — upgrades/downgrades severity based on content
 // ---------------------------------------------------------------------------
 
 func analyzeFinding(f *Finding) {
 	switch f.Check {
+	case "DELETED":
+		// If dpkg confirms the binary's package was upgraded, this is a
+		// stale process — not malware. Downgrade from CRITICAL to MEDIUM.
+		if strings.Contains(f.Detail, "[PKG_UPGRADED=") {
+			f.Severity = SevMedium
+		}
+
 	case "PROCHIDE":
 		// ps=X proc=Y diff=Z — diff > 5 means processes are hidden
 		for _, part := range strings.Fields(f.Detail) {
@@ -159,27 +190,48 @@ func analyzeFinding(f *Finding) {
 		}
 
 	case "TAINTED":
-		if strings.TrimSpace(f.Detail) != "0" {
-			f.Severity = SevHigh
+		raw := strings.TrimSpace(f.Detail)
+		// Extract the numeric taint value (may have [KNOWN_DRIVERS=...] appended)
+		taintStr := strings.Fields(raw)[0]
+		if taintStr != "0" {
+			if val, err := strconv.Atoi(taintStr); err == nil {
+				var flags []string
+				for bit := 0; bit < 18; bit++ {
+					if val&(1<<bit) != 0 {
+						if desc, ok := taintFlags[bit]; ok {
+							flags = append(flags, desc)
+						} else {
+							flags = append(flags, fmt.Sprintf("bit%d", bit))
+						}
+					}
+				}
+				decoded := strings.Join(flags, ", ")
+				if strings.Contains(raw, "[KNOWN_DRIVERS=") {
+					// All out-of-tree modules are known drivers — not suspicious
+					drivers := raw[strings.Index(raw, "[KNOWN_DRIVERS=")+15:]
+					drivers = strings.TrimSuffix(drivers, "]")
+					f.Detail = fmt.Sprintf("%s (%s) [KNOWN_DRIVERS=%s]", taintStr, decoded, drivers)
+					f.Severity = SevInfo
+				} else {
+					f.Detail = fmt.Sprintf("%s (%s)", taintStr, decoded)
+					f.Severity = SevHigh
+				}
+			} else {
+				f.Severity = SevHigh
+			}
 		}
 
 	case "HISTORY":
 		if strings.Contains(f.Detail, "SYMLINKED") {
 			f.Severity = SevCritical // deliberate evasion
 		} else if strings.Contains(f.Detail, "MISSING") || strings.Contains(f.Detail, "EMPTY") {
-			if strings.Contains(f.Detail, "/root") {
+			if strings.Contains(f.Detail, "[APPLIANCE_OS]") {
+				// Appliance OSes (TrueNAS, pfSense, Proxmox, etc.) don't persist history
+				f.Severity = SevInfo
+			} else if strings.Contains(f.Detail, "/root") {
 				f.Severity = SevHigh
 			} else {
 				f.Severity = SevMedium
-			}
-		}
-
-	case "SHADOWPERMS":
-		// Normal: -rw-r----- or -rw-------
-		if !strings.HasPrefix(f.Detail, "-rw-r-----") && !strings.HasPrefix(f.Detail, "-rw-------") {
-			f.Severity = SevHigh
-			if strings.Contains(f.Detail, "rw-rw") || strings.Contains(f.Detail, "r--r--r--") {
-				f.Severity = SevCritical // world or group readable
 			}
 		}
 
@@ -216,8 +268,126 @@ func analyzeFinding(f *Finding) {
 		}
 
 	case "FAILEDAUTH":
-		// High volume of failures is suspicious
-		f.Severity = SevLow
+		if strings.HasPrefix(f.Detail, "TOTAL_FAILURES=") {
+			countStr := strings.TrimPrefix(f.Detail, "TOTAL_FAILURES=")
+			if count, err := strconv.Atoi(countStr); err == nil {
+				if count > 100 {
+					f.Severity = SevHigh
+					f.Detail = fmt.Sprintf("%d failed auth attempts in 24h — possible brute force", count)
+				} else if count > 20 {
+					f.Severity = SevMedium
+					f.Detail = fmt.Sprintf("%d failed auth attempts in 24h", count)
+				} else {
+					f.Severity = SevLow
+					f.Detail = fmt.Sprintf("%d failed auth attempts in 24h", count)
+				}
+			}
+		} else {
+			f.Severity = SevLow
+		}
+
+	case "AUTHKEYS":
+		// Header lines: "/path: keys=N age_days=X"
+		// Key content lines: ssh-rsa/ssh-ed25519 ...
+		if strings.Contains(f.Detail, "age_days=") {
+			// Parse age — if not recently modified, downgrade to INFO
+			for _, part := range strings.Fields(f.Detail) {
+				if strings.HasPrefix(part, "age_days=") {
+					if days, err := strconv.Atoi(strings.TrimPrefix(part, "age_days=")); err == nil {
+						if days > 7 {
+							f.Severity = SevInfo
+						}
+						// Recently modified stays MEDIUM
+					}
+				}
+			}
+		} else {
+			// Key content lines are informational context
+			f.Severity = SevInfo
+		}
+
+	case "MODBINS":
+		// Binaries modified by a package upgrade are expected
+		if strings.Contains(f.Detail, "[PKG_UPGRADED=") {
+			f.Severity = SevInfo
+		}
+
+	case "CRON":
+		// Downgrade standard distro cron scripts to INFO
+		lower := strings.ToLower(f.Detail)
+		for _, standard := range []string{
+			"e2scrub_all", "sysstat", "apport", "apt-compat",
+			"dpkg", "logrotate", "man-db", "popularity-contest",
+			"update-notifier-common", "google-chrome",
+			"0hourly", "0anacron", "raid-check",
+		} {
+			if strings.Contains(lower, standard) {
+				f.Severity = SevInfo
+				break
+			}
+		}
+		// Alpine default periodic crontabs (present in every Alpine container)
+		if strings.Contains(f.Detail, "run-parts /etc/periodic/") {
+			f.Severity = SevInfo
+		}
+		// Placeholder files
+		if strings.Contains(lower, ".placeholder") {
+			f.Severity = SevInfo
+		}
+
+	case "RCLOCAL":
+		// Known third-party services installed via packages are not persistence IoCs
+		lower := strings.ToLower(f.Detail)
+		for _, known := range []string{
+			"docker", "filebeat", "wazuh", "elasticsearch", "kibana",
+			"logstash", "nginx", "mysql", "mariadb", "postgresql",
+			"redis", "containerd", "snapd", "tailscale", "netbird",
+			"wireguard", "zerotier", "openvpn", "fail2ban", "certbot",
+			"grafana", "prometheus", "telegraf", "zabbix", "ntp", "chrony",
+		} {
+			if strings.Contains(lower, known) {
+				f.Severity = SevInfo
+				break
+			}
+		}
+
+	case "LOGCHECK":
+		// Empty logs that are normal: apport, alternatives, rotated mail/spooler logs
+		lower := strings.ToLower(f.Detail)
+		if strings.Contains(lower, "apport") || strings.Contains(lower, "alternatives") ||
+			strings.Contains(lower, "maillog") || strings.Contains(lower, "spooler") ||
+			strings.Contains(lower, "boot.log") {
+			f.Severity = SevInfo
+		}
+		// RHEL-style rotated logs with date suffixes (e.g., spooler-20260222)
+		for _, base := range []string{"maillog-", "spooler-", "secure-", "messages-", "cron-"} {
+			if strings.Contains(lower, base) {
+				f.Severity = SevInfo
+				break
+			}
+		}
+
+	case "PAM":
+		// PAM files owned by a distro package are not suspicious
+		if strings.Contains(f.Detail, "[PKG_OWNED]") {
+			f.Severity = SevInfo
+		}
+
+	case "SHADOWPERMS":
+		// Normal: -rw-r----- or -rw------- or ---------- (mode 000, RHEL default)
+		if strings.HasPrefix(f.Detail, "-rw-r-----") || strings.HasPrefix(f.Detail, "-rw-------") || strings.HasPrefix(f.Detail, "----------") {
+			f.Severity = SevInfo
+		} else if strings.Contains(f.Detail, "rw-rw") || strings.Contains(f.Detail, "r--r--r--") {
+			f.Severity = SevCritical // world or group readable
+		} else {
+			f.Severity = SevHigh
+		}
+
+	case "HIDDEN":
+		// Python tempfile .lock files are normal application behavior
+		if strings.HasSuffix(f.Detail, "/.lock") && strings.Contains(f.Detail, "/tmp/tmp") {
+			f.Severity = SevInfo
+		}
 	}
 }
 
@@ -253,35 +423,36 @@ func computeVerdict(findings []Finding, containers []ContainerResult) string {
 
 const triageScript = `
 echo "===MEMEXEC===" && find /dev/shm /tmp /var/tmp -type f -executable 2>/dev/null
-echo "===DELETED===" && ls -al /proc/*/exe 2>/dev/null | grep 'deleted'
+echo "===DELETED===" && ls -al /proc/*/exe 2>/dev/null | grep 'deleted' | while IFS= read -r line; do bin=$(echo "$line" | sed 's/.* -> //; s/ (deleted)//'); upgraded=false; pkg=""; if command -v dpkg >/dev/null 2>&1; then pkg=$(dpkg -S "$bin" 2>/dev/null | head -1 | cut -d: -f1); [ -n "$pkg" ] && zgrep -qm1 " upgrade $pkg:" /var/log/dpkg.log* 2>/dev/null && upgraded=true; elif command -v rpm >/dev/null 2>&1; then pkg=$(rpm -qf "$bin" 2>/dev/null); [ $? -eq 0 ] && upgraded=true; fi; if $upgraded; then echo "${line} [PKG_UPGRADED=${pkg}]"; else echo "$line"; fi; done
 echo "===UID0===" && awk -F: '$3 == 0 && $1 != "root" {print $1}' /etc/passwd
-echo "===CRON===" && crontab -l -u root 2>/dev/null; for u in $(cut -d: -f1 /etc/passwd); do crontab -l -u "$u" 2>/dev/null | grep -v '^#' | grep -v '^$' | sed "s/^/$u: /"; done; ls -la /etc/cron.d/ /etc/cron.daily/ /etc/cron.hourly/ /etc/cron.weekly/ /etc/cron.monthly/ 2>/dev/null | grep -v '^total' | grep -v '^$'
-echo "===SUID===" && find / -perm -4000 -o -perm -2000 2>/dev/null | grep -vE '^/(usr/(bin|lib|libexec|sbin)|bin|sbin|proc|sys|snap)/'
+echo "===CRON===" && crontab -l -u root 2>/dev/null; for u in $(cut -d: -f1 /etc/passwd); do crontab -l -u "$u" 2>/dev/null | grep -v '^#' | grep -v '^$' | sed "s/^/$u: /"; done; for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly; do [ -d "$d" ] && for f in "$d"/*; do [ -f "$f" ] && basename "$f" | grep -qvE '^\.placeholder$' && echo "$d/$(basename "$f")"; done; done
+echo "===SUID===" && find / -path /var/lib/docker -prune -o -path /var/lib/containers -prune -o -type f \( -perm -4000 -o -perm -2000 \) -print 2>/dev/null | grep -vE '^/(usr/(bin|lib|libexec|sbin)|bin|sbin|proc|sys|snap)/'
+echo "===SGIDDIR===" && find / -path /var/lib/docker -prune -o -path /var/lib/containers -prune -o -type d -perm -2000 -print 2>/dev/null | grep -vE '^/(usr/(bin|lib|libexec|sbin)|bin|sbin|proc|sys|snap)/'
 echo "===SERVICES===" && systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null | awk '{print $1}'
 echo "===LISTEN===" && ss -tlnp 2>/dev/null | tail -n +2
 echo "===KMOD===" && lsmod 2>/dev/null | tail -n +2 | awk '{print $1}'
-echo "===AUTHKEYS===" && for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do [ -f "$f" ] && echo "$f:" && cat "$f"; done 2>/dev/null
+echo "===AUTHKEYS===" && for f in /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys; do [ -f "$f" ] && keys=$(wc -l < "$f" | tr -d ' ') && mod=$(stat -c %Y "$f") && now=$(date +%s) && age=$(( (now - mod) / 86400 )) && echo "$f: keys=$keys age_days=$age" && cat "$f"; done 2>/dev/null
 echo "===HIDDEN===" && find /tmp /dev/shm /var/tmp -name '.*' -type f 2>/dev/null
 echo "===NETNS===" && ls /var/run/netns/ 2>/dev/null; ip netns list 2>/dev/null
 echo "===CONTAINERENV===" && cat /proc/1/cgroup 2>/dev/null | head -5; [ -f /.dockerenv ] && echo "dockerenv=true"; [ -f /run/.containerenv ] && echo "containerenv=true"
 echo "===TIMERS===" && systemctl list-timers --no-pager --no-legend 2>/dev/null
 echo "===SHELLINIT===" && for u in /root /home/*; do for rc in .bashrc .bash_profile .profile; do [ -f "$u/$rc" ] && grep -nE '(curl |wget |nc |ncat |python|perl -e|ruby -e|base64|eval |exec )' "$u/$rc" 2>/dev/null | sed "s|^|$u/$rc:|"; done; done; find /etc/profile.d/ -type f -newer /etc/passwd 2>/dev/null
 echo "===LDPRELOAD===" && cat /etc/ld.so.preload 2>/dev/null
-echo "===RCLOCAL===" && cat /etc/rc.local 2>/dev/null | grep -v '^#' | grep -v '^$' | grep -v '^exit 0'; ls /etc/init.d/ 2>/dev/null | grep -vE '^(README|skeleton|rc|rcS|single|.*\.dpkg)'
-echo "===PAM===" && find /etc/pam.d/ -type f -newer /etc/passwd 2>/dev/null; find /lib/security/ /lib64/security/ /usr/lib/security/ /usr/lib64/security/ -name '*.so' -newer /etc/passwd -type f 2>/dev/null
+echo "===RCLOCAL===" && cat /etc/rc.local 2>/dev/null | grep -v '^#' | grep -v '^$' | grep -v '^exit 0'; ls /etc/init.d/ 2>/dev/null | grep -vE '^(README|skeleton|rc|rcS|single|.*\.dpkg|apparmor|apport|console-setup\.sh|cron|cryptdisks|cryptdisks-early|dbus|grub-common|hwclock\.sh|irqbalance|iscsid|keyboard-setup\.sh|kmod|lvm2.*|mdadm.*|nfs-common|open-iscsi|open-vm-tools|plymouth|plymouth-log|procps|rpcbind|rsync|rsyslog|screen-cleanup|ssh|sudo|sysstat|ubuntu-fan|udev|ufw|unattended-upgrades|uuidd|x11-common)$'
+echo "===PAM===" && pam_check() { for f in "$@"; do if command -v rpm >/dev/null 2>&1; then rpm -qf "$f" >/dev/null 2>&1 && echo "$f [PKG_OWNED]" || echo "$f"; elif command -v dpkg >/dev/null 2>&1; then dpkg -S "$f" >/dev/null 2>&1 && echo "$f [PKG_OWNED]" || echo "$f"; else echo "$f"; fi; done; }; pam_check $(find /etc/pam.d/ -type f -newer /etc/passwd 2>/dev/null) $(find /lib/security/ /lib64/security/ /usr/lib/security/ /usr/lib64/security/ -name '*.so' -newer /etc/passwd -type f 2>/dev/null)
 echo "===ATJOBS===" && atq 2>/dev/null
 echo "===PROCHIDE===" && ps_count=$(ps aux 2>/dev/null | tail -n +2 | wc -l); proc_count=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l); echo "ps=$ps_count proc=$proc_count diff=$((proc_count - ps_count))"
-echo "===MODBINS===" && find /usr/bin /usr/sbin /bin /sbin -type f -mtime -7 2>/dev/null | head -50
+echo "===MODBINS===" && find /usr/bin /usr/sbin /bin /sbin -type f -mtime -7 2>/dev/null | head -50 | while IFS= read -r bin; do upgraded=false; if command -v dpkg >/dev/null 2>&1; then pkg=$(dpkg -S "$bin" 2>/dev/null | head -1 | cut -d: -f1); [ -n "$pkg" ] && zgrep -qm1 " upgrade $pkg:" /var/log/dpkg.log* 2>/dev/null && upgraded=true; elif command -v rpm >/dev/null 2>&1; then pkg=$(rpm -qf "$bin" 2>/dev/null); [ $? -eq 0 ] && upgraded=true; fi; if $upgraded; then echo "${bin} [PKG_UPGRADED=${pkg}]"; else echo "$bin"; fi; done
 echo "===IMMUTABLE===" && lsattr -R /etc /tmp /var/tmp /dev/shm 2>/dev/null | grep -- '----i'
-echo "===TAINTED===" && cat /proc/sys/kernel/tainted 2>/dev/null
-echo "===HISTORY===" && for u in /root /home/*; do [ -d "$u" ] && hist="$u/.bash_history" && if [ -L "$hist" ]; then echo "$u: SYMLINKED -> $(readlink -f "$hist")"; elif [ ! -f "$hist" ]; then echo "$u: MISSING"; elif [ ! -s "$hist" ]; then echo "$u: EMPTY"; fi; done
+echo "===TAINTED===" && tval=$(cat /proc/sys/kernel/tainted 2>/dev/null); if [ "$tval" != "0" ] && [ -n "$tval" ]; then oot=""; for tf in /sys/module/*/taint; do [ -r "$tf" ] && tv=$(cat "$tf" 2>/dev/null | tr -d '[:space:]') && [ -n "$tv" ] && mod=$(basename "$(dirname "$tf")") && oot="$oot $mod"; done; oot=$(echo "$oot" | xargs); known=true; if [ -n "$oot" ]; then for m in $oot; do case "$m" in nvidia*|nv_*|vmw_*|vmmon|vmnet|vboxdrv|vboxnetflt|vboxnetadp|vboxpci|wireguard|zfs|spl) ;; *) known=false; break ;; esac; done; fi; if $known && [ -n "$oot" ]; then echo "${tval} [KNOWN_DRIVERS=${oot// /,}]"; else echo "$tval"; fi; else echo "$tval"; fi
+echo "===HISTORY===" && appliance=false; { [ -d /usr/share/truenas ] || [ -f /etc/pve/.version ] || [ -f /etc/opnsense_version ] || [ -d /cf/conf ] || [ -d /etc/unifi ] || [ -f /etc/synoinfo.conf ] || [ -f /etc/config/uLinux.conf ]; } && appliance=true; for u in /root /home/*; do [ -d "$u" ] && hist="$u/.bash_history" && if [ -L "$hist" ]; then echo "$u: SYMLINKED -> $(readlink -f "$hist")"; elif [ ! -f "$hist" ]; then $appliance && echo "$u: MISSING [APPLIANCE_OS]" || echo "$u: MISSING"; elif [ ! -s "$hist" ]; then $appliance && echo "$u: EMPTY [APPLIANCE_OS]" || echo "$u: EMPTY"; fi; done
 echo "===KNOWNHOSTS===" && for f in /root/.ssh/known_hosts /home/*/.ssh/known_hosts; do [ -f "$f" ] && echo "$f: $(wc -l < "$f") hosts"; done 2>/dev/null
 echo "===SHADOWPERMS===" && ls -la /etc/shadow 2>/dev/null
 echo "===OUTBOUND===" && ss -tnp 2>/dev/null | grep ESTAB
 echo "===DNSCONF===" && cat /etc/resolv.conf 2>/dev/null | grep -v '^#' | grep -v '^$'
 echo "===IPTABLES===" && iptables -L -n --line-numbers 2>/dev/null | grep -vE '^Chain|^num|^$|policy ACCEPT' | head -30
-echo "===FAILEDAUTH===" && journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -iE 'fail|invalid|refused' | tail -20; grep -iE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null | tail -20
-echo "===LOGCHECK===" && find /var/log -maxdepth 1 -type f -empty 2>/dev/null; find /var/log -maxdepth 1 -type f -size 0 2>/dev/null
+echo "===FAILEDAUTH===" && count=0; lines=""; if command -v journalctl >/dev/null 2>&1; then lines=$(journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -ciE 'fail|invalid|refused'); fi; fcount=$(grep -ciE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null || echo 0); count=$((lines + fcount)); echo "TOTAL_FAILURES=$count"; journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -iE 'fail|invalid|refused' | tail -20; grep -iE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null | tail -20
+echo "===LOGCHECK===" && find /var/log -maxdepth 1 -type f -empty ! -name '*.1' ! -name '*.gz' ! -name '*.old' ! -name '*.xz' ! -name 'faillog' ! -name 'btmp' ! -name 'lastlog' 2>/dev/null | grep -vE '\-[0-9]{8}$'
 echo "===DONE==="
 `
 
@@ -301,8 +472,8 @@ if command -v find >/dev/null 2>&1; then find /tmp /dev/shm /var/tmp -name '.*' 
 echo "===CT_USERS==="
 [ -r /etc/passwd ] && awk -F: '$3 == 0 && $1 != "root" {print $1}' /etc/passwd 2>/dev/null
 echo "===CT_CRON==="
-if command -v crontab >/dev/null 2>&1; then crontab -l 2>/dev/null | grep -v '^#' | grep -v '^$'; fi
-for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly; do [ -d "$d" ] && ls -la "$d" 2>/dev/null | grep -v '^total'; done
+if command -v crontab >/dev/null 2>&1; then crontab -l 2>/dev/null | grep -v '^#' | grep -v '^$' | grep -v '^[[:space:]]*$'; fi
+for d in /etc/cron.d /etc/cron.daily /etc/cron.hourly; do [ -d "$d" ] && for f in "$d"/*; do [ -f "$f" ] && echo "$d/$(basename "$f")"; done 2>/dev/null; done
 echo "===CT_DOCKERSOCK==="
 [ -S /var/run/docker.sock ] && echo "/var/run/docker.sock EXISTS"
 ls -la /var/run/docker.sock 2>/dev/null
@@ -322,6 +493,7 @@ var sectionMarkers = map[string]string{
 	"===UID0===":         "UID0",
 	"===CRON===":         "CRON",
 	"===SUID===":         "SUID",
+	"===SGIDDIR===":      "SGIDDIR",
 	"===SERVICES===":     "SERVICES",
 	"===LISTEN===":       "LISTEN",
 	"===KMOD===":         "KMOD",
@@ -559,11 +731,29 @@ func triageContainers(client *ssh.Client, sudoPassword string, isRoot bool, ip s
 				`||CAPADD={{.HostConfig.CapAdd}}`+
 				`||NETMODE={{.HostConfig.NetworkMode}}`+
 				`||PIDMODE={{.HostConfig.PidMode}}`+
+				`||DEVICES={{range .HostConfig.Devices}}{{.PathOnHost}},{{end}}`+
 				`' %s`,
 			runtime, ct.ID,
 		)
 		inspectOut, _ := runAsRoot(client, inspectCmd, sudoPassword, isRoot)
 		inspectOut = strings.TrimSpace(inspectOut)
+
+		// Detect VPN containers: known image + /dev/net/tun device
+		vpnImages := []string{"gluetun", "wireguard", "openvpn", "tailscale", "netbird", "nordvpn", "surfshark", "pia-"}
+		isVPN := false
+		hasTun := false
+		imageLower := strings.ToLower(ct.Image)
+		for _, vpn := range vpnImages {
+			if strings.Contains(imageLower, vpn) {
+				isVPN = true
+				break
+			}
+		}
+		for _, field := range strings.Split(inspectOut, "||") {
+			if strings.HasPrefix(field, "DEVICES=") && strings.Contains(field, "/dev/net/tun") {
+				hasTun = true
+			}
+		}
 
 		if strings.Contains(inspectOut, "PRIV=true") {
 			cr.Findings = append(cr.Findings, Finding{
@@ -579,8 +769,15 @@ func triageContainers(client *ssh.Client, sudoPassword string, isRoot bool, ip s
 					for _, cap := range strings.Fields(caps) {
 						cap = strings.TrimSpace(cap)
 						if dangerousCaps[cap] {
+							sev := SevHigh
+							detail := "dangerous capability: " + cap
+							// VPN containers need NET_ADMIN + tun for tunnel creation
+							if cap == "NET_ADMIN" && isVPN && hasTun {
+								sev = SevInfo
+								detail = "NET_ADMIN capability (expected — VPN tunnel creation)"
+							}
 							cr.Findings = append(cr.Findings, Finding{
-								Check: "CONFIG", Detail: "dangerous capability: " + cap, Severity: SevHigh,
+								Check: "CONFIG", Detail: detail, Severity: sev,
 							})
 						}
 					}
@@ -625,11 +822,23 @@ func triageContainers(client *ssh.Client, sudoPassword string, isRoot bool, ip s
 				sev = SevCritical
 				detail += " — HOST ROOT FILESYSTEM"
 			} else {
-				for _, sensitive := range []string{"/etc", "/root", "/home", "/var/run"} {
-					if src == sensitive || strings.HasPrefix(src, sensitive+"/") {
-						sev = SevHigh
-						detail += " — sensitive host path"
-						break
+				// Safe read-only single-file mounts
+				safeRO := false
+				if rw == "false" {
+					for _, safe := range []string{"/etc/localtime", "/etc/timezone", "/etc/resolv.conf", "/etc/hostname", "/etc/hosts"} {
+						if src == safe {
+							safeRO = true
+							break
+						}
+					}
+				}
+				if !safeRO {
+					for _, sensitive := range []string{"/etc", "/root", "/home", "/var/run"} {
+						if src == sensitive || strings.HasPrefix(src, sensitive+"/") {
+							sev = SevHigh
+							detail += " — sensitive host path"
+							break
+						}
 					}
 				}
 			}
@@ -675,8 +884,10 @@ func triageContainers(client *ssh.Client, sudoPassword string, isRoot bool, ip s
 // Host triage orchestrator
 // ---------------------------------------------------------------------------
 
-func triageHost(ip, port, username, sshPassword, sudoPassword, keyPath string) HostResult {
-	result := HostResult{IP: ip}
+func triageHost(ip, port, username, sshPassword, sudoPassword, keyPath string) (result HostResult) {
+	start := time.Now()
+	result = HostResult{IP: ip}
+	defer func() { result.Duration = time.Since(start).Round(time.Millisecond).String() }()
 
 	authMethods := buildAuthMethods(sshPassword, keyPath)
 	if len(authMethods) == 0 {
@@ -812,12 +1023,12 @@ func allFindings(r HostResult) []Finding {
 }
 
 func renderTable(results []HostResult) string {
-	critStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))    // bright red
-	highStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))                  // red
-	medStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))                  // yellow
-	lowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("12"))                  // blue
-	infoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))                  // dim
-	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))                   // green
+	critStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196")) // bright red
+	highStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("9"))              // red
+	medStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))              // yellow
+	lowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("12"))              // blue
+	infoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))              // dim
+	okStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("10"))               // green
 	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
 	borderStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("62"))
 
@@ -831,13 +1042,13 @@ func renderTable(results []HostResult) string {
 			findingStr = r.Error
 		}
 		ctCount := fmt.Sprintf("%d", len(r.Containers))
-		rows = append(rows, []string{r.IP, r.Status, r.Verdict, r.RootMethod, ctCount, findingStr})
+		rows = append(rows, []string{r.IP, r.Status, r.Verdict, r.RootMethod, ctCount, r.Duration, findingStr})
 	}
 
 	t := table.New().
 		Border(lipgloss.RoundedBorder()).
 		BorderStyle(borderStyle).
-		Headers("HOST", "STATUS", "VERDICT", "PRIV", "CT", "FINDINGS (C/H/M/L/I)").
+		Headers("HOST", "STATUS", "VERDICT", "PRIV", "CT", "TIME", "FINDINGS (C/H/M/L/I)").
 		StyleFunc(func(row, col int) lipgloss.Style {
 			if row == table.HeaderRow {
 				return headerStyle
