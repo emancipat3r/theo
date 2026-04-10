@@ -83,25 +83,36 @@ type HostResult struct {
 
 var defaultSeverity = map[string]Severity{
 	// Definitive IoC indicators
-	"DELETED":    SevCritical,
-	"UID0":       SevCritical,
-	"LDPRELOAD":  SevCritical,
-	"PROCHIDE":   SevCritical,
-	"MEMEXEC":    SevHigh,
-	"SUID":       SevHigh,
-	"HIDDEN":     SevHigh,
-	"SHELLINIT":  SevHigh,
-	"PAM":        SevHigh,
-	"IMMUTABLE":  SevHigh,
-	"MODBINS":    SevMedium,
-	"LOGCHECK":   SevMedium,
-	"CRON":       SevMedium,
-	"AUTHKEYS":   SevMedium,
-	"RCLOCAL":    SevMedium,
-	"ATJOBS":     SevMedium,
-	"FAILEDAUTH": SevLow,
-	"IPTABLES":   SevLow,
-	"OUTBOUND":   SevLow,
+	"DELETED":      SevCritical,
+	"UID0":         SevCritical,
+	"LDPRELOAD":    SevCritical,
+	"PROCHIDE":     SevCritical,
+	"MEMEXEC":      SevHigh,
+	"SUID":         SevHigh,
+	"HIDDEN":       SevHigh,
+	"SHELLINIT":    SevHigh,
+	"PAM":          SevHigh,
+	"IMMUTABLE":    SevHigh,
+	"MODBINS":      SevMedium,
+	"LOGCHECK":     SevMedium,
+	"CRON":         SevMedium,
+	"AUTHKEYS":     SevMedium,
+	"RCLOCAL":      SevMedium,
+	"ATJOBS":       SevMedium,
+	"FAILEDAUTH":   SevLow,
+	"IPTABLES":     SevLow,
+	"OUTBOUND":     SevLow,
+	"PKGVERIFY":    SevMedium,
+	"PROCTREE":     SevInfo,
+	"PROCMASQ":     SevMedium,
+	"ORPHANBIN":    SevMedium,
+	"PROCMEM":      SevMedium,
+	"PROCENV":      SevHigh,
+	"LOGGAP":       SevMedium,
+	"ORPHANSVC":    SevMedium,
+	"USERACCT":     SevInfo,
+	"DNSLEAK":      SevMedium,
+	"LISTENORPHAN": SevMedium,
 
 	// Informational — context, not IoCs by default
 	"SERVICES":     SevInfo,
@@ -179,11 +190,270 @@ var taintFlags = map[int]string{
 }
 
 // ---------------------------------------------------------------------------
+// Helpers & Data structures for checks
+// ---------------------------------------------------------------------------
+
+func parseKV(detail, key string) string {
+	prefix := key + "="
+	for _, part := range strings.Fields(detail) {
+		if strings.HasPrefix(part, prefix) {
+			return strings.TrimPrefix(part, prefix)
+		}
+	}
+	return ""
+}
+
+type procAnomalyRule struct {
+	ParentContains []string
+	ChildContains  []string
+	Severity       Severity
+	Tag            string
+}
+
+var procTreeRules = []procAnomalyRule{
+	{
+		ParentContains: []string{"apache", "httpd", "nginx", "lighttpd", "caddy", "tomcat"},
+		ChildContains:  []string{"/bin/sh", "/bin/bash", "/bin/dash", "/bin/zsh", "python", "perl", "ruby"},
+		Severity:       SevCritical,
+		Tag:            "WEB SHELL: web server spawned interactive process",
+	},
+	{
+		ParentContains: []string{"sshd"},
+		ChildContains:  []string{"python", "perl", "ruby", "nc", "ncat", "socat"},
+		Severity:       SevHigh,
+		Tag:            "unusual sshd child process",
+	},
+}
+
+var procMasqAllowed = []string{"busybox", "python", "perl", "node", "java"}
+var orphanbinAllowed = []string{"docker-compose", "kubectl", "helm", "terraform", "packer", "vault", "consul", "go", "rustup", "cargo", "node", "npm", "pip", "pip3"}
+var procMemJIT = []string{"java", "node", "python", "ruby", "dotnet", "mono", "chrome", "chromium", "firefox", "v8", "qemu", "containerd-shim"}
+var orphanSvcAllowed = []string{"docker", "containerd", "tailscaled", "netbird", "cloudflare", "zerotier", "node_exporter", "prometheus", "grafana", "telegraf", "filebeat", "elastic-agent"}
+var listenOrphanAllowed = []string{"docker-proxy", "containerd", "kubelet", "node_exporter", "prometheus", "grafana-server", "caddy", "minio", "tailscaled", "netbird"}
+
+// ---------------------------------------------------------------------------
 // Analysis — upgrades/downgrades severity based on content
 // ---------------------------------------------------------------------------
 
 func analyzeFinding(f *Finding) {
 	switch f.Check {
+	case "PKGVERIFY":
+		if strings.Contains(f.Detail, "[CONFFILE]") {
+			f.Severity = SevInfo
+		} else if strings.Contains(f.Detail, "[HASH_MISMATCH]") {
+			f.Severity = SevHigh
+		}
+
+	case "PROCTREE":
+		exe := parseKV(f.Detail, "exe")
+		pexe := parseKV(f.Detail, "pexe")
+		uid := parseKV(f.Detail, "uid")
+
+		if strings.HasPrefix(exe, "/tmp/") || strings.HasPrefix(exe, "/dev/shm/") || strings.HasPrefix(exe, "/var/tmp/") || strings.HasPrefix(exe, "/run/user/") {
+			f.Severity = SevHigh
+			f.Detail += " — executable in temp directory"
+		} else if uid == "0" && !strings.HasPrefix(exe, "/usr/") && !strings.HasPrefix(exe, "/bin/") && !strings.HasPrefix(exe, "/sbin/") && !strings.HasPrefix(exe, "/lib/") && !strings.HasPrefix(exe, "/opt/") {
+			f.Severity = SevMedium
+			f.Detail += " — root process from non-standard path"
+		} else {
+			for _, rule := range procTreeRules {
+				pMatch := false
+				for _, p := range rule.ParentContains {
+					if strings.Contains(pexe, p) {
+						pMatch = true
+						break
+					}
+				}
+				if !pMatch {
+					continue
+				}
+				cMatch := false
+				for _, c := range rule.ChildContains {
+					if strings.Contains(exe, c) {
+						cMatch = true
+						break
+					}
+				}
+				if cMatch {
+					f.Severity = rule.Severity
+					f.Detail += " — " + rule.Tag
+					break
+				}
+			}
+		}
+
+	case "PROCMASQ":
+		exe := parseKV(f.Detail, "exe")
+		cmdline := parseKV(f.Detail, "cmdline")
+		cmd0 := strings.Fields(cmdline)
+
+		if len(cmd0) > 0 {
+
+		}
+
+		if strings.Contains(exe, "/tmp/") || strings.Contains(exe, "/dev/shm/") || strings.Contains(exe, "/var/tmp/") || strings.Contains(exe, "(deleted)") {
+			f.Severity = SevCritical
+			f.Detail += " [MASQUERADE: temp/deleted binary mismatched]"
+		} else if strings.HasPrefix(cmdline, "[k") && exe != "" {
+			f.Severity = SevCritical
+			f.Detail += " [MASQUERADE: fake kernel thread]"
+		} else {
+			allowed := false
+			for _, al := range procMasqAllowed {
+				if strings.Contains(exe, al) {
+					if al == "java" && strings.Contains(cmdline, "-jar") {
+						allowed = true
+						break
+					}
+					if al == "node" && strings.Contains(cmdline, ".js") {
+						allowed = true
+						break
+					}
+					if al == "python" || al == "perl" || al == "busybox" {
+						allowed = true
+						break
+					}
+				}
+			}
+			if allowed {
+				f.Severity = SevInfo
+			}
+		}
+
+	case "ORPHANBIN":
+		if strings.HasPrefix(f.Detail, "/usr/local/") {
+			f.Severity = SevInfo
+		} else if strings.HasPrefix(f.Detail, "/usr/bin") || strings.HasPrefix(f.Detail, "/usr/sbin") {
+			base := filepath.Base(strings.Fields(f.Detail)[0])
+			allowed := false
+			for _, al := range orphanbinAllowed {
+				if base == al {
+					allowed = true
+					break
+				}
+			}
+			if allowed {
+				f.Severity = SevInfo
+			}
+		}
+
+	case "PROCMEM":
+		anonStr := parseKV(f.Detail, "anon_rwx")
+		exe := parseKV(f.Detail, "exe")
+		if n, err := strconv.Atoi(anonStr); err == nil {
+			if n > 50 {
+				f.Severity = SevCritical
+			} else if n > 10 {
+				f.Severity = SevHigh
+			}
+			isJIT := false
+			for _, jit := range procMemJIT {
+				if strings.Contains(exe, jit) {
+					isJIT = true
+					break
+				}
+			}
+			if isJIT {
+				if f.Severity == SevCritical {
+					f.Severity = SevHigh
+				} else if f.Severity == SevHigh {
+					f.Severity = SevMedium
+				} else if f.Severity == SevMedium || n <= 3 {
+					f.Severity = SevInfo
+				}
+			}
+			if n <= 3 && isJIT {
+				f.Severity = SevInfo
+			}
+		}
+
+	case "PROCENV":
+		if strings.Contains(f.Detail, "LD_PRELOAD=/tmp/") || strings.Contains(f.Detail, "LD_PRELOAD=/dev/shm/") || strings.Contains(f.Detail, "LD_PRELOAD=/var/tmp/") || strings.Contains(f.Detail, "LD_PRELOAD=.") {
+			f.Severity = SevCritical
+		} else if strings.Contains(f.Detail, "LD_PRELOAD=/usr/lib") || strings.Contains(f.Detail, "LD_PRELOAD=/lib") || strings.Contains(f.Detail, "LD_PRELOAD=/usr/lib64") {
+			f.Severity = SevMedium
+		} else if strings.HasSuffix(f.Detail, "LD_PRELOAD=") {
+			f.Severity = SevInfo
+		}
+
+	case "LOGGAP":
+		if strings.Contains(f.Detail, "gap=") {
+			gapStr := ""
+			parts := strings.Split(f.Detail, "gap=")
+			if len(parts) == 2 {
+				gapStr = strings.Split(parts[1], "s")[0]
+			}
+			if gap, err := strconv.Atoi(gapStr); err == nil {
+				if gap > 86400 {
+					f.Severity = SevHigh
+				}
+			}
+		} else if strings.Contains(f.Detail, "rate=") {
+			f.Severity = SevInfo
+		}
+
+	case "ORPHANSVC":
+		allowed := false
+		for _, svc := range orphanSvcAllowed {
+			if strings.Contains(f.Detail, svc) {
+				allowed = true
+				break
+			}
+		}
+		if allowed {
+			f.Severity = SevInfo
+		} else {
+			if strings.Contains(f.Detail, "path=/etc/systemd/system/") {
+				f.Detail += " [USER_CREATED_SYSTEMD_DIR]"
+			}
+		}
+
+	case "USERACCT":
+		neverLogged := parseKV(f.Detail, "never_logged") == "1"
+		sudoer := parseKV(f.Detail, "sudoer") == "true"
+		uidStr := parseKV(f.Detail, "uid")
+		uid, _ := strconv.Atoi(uidStr)
+		hasHome := parseKV(f.Detail, "home_exists") == "true"
+
+		if neverLogged && sudoer {
+			f.Severity = SevHigh
+			f.Detail += " [dormant sudoer account]"
+		} else if neverLogged && uid >= 1000 && !hasHome {
+			f.Severity = SevMedium
+			f.Detail += " [phantom user — no home, never logged in]"
+		} else if strings.HasPrefix(f.Detail, "/etc/sudoers.d/") && strings.Contains(f.Detail, "[UNPACKAGED]") {
+			f.Severity = SevMedium
+			f.Detail += " [unpackaged sudoers drop-in]"
+		}
+
+	case "DNSLEAK":
+		if strings.Contains(f.Detail, "[NON_CONFIGURED_DNS=") {
+			if strings.Contains(f.Detail, "127.0.0.1") || strings.Contains(f.Detail, "127.0.0.53") || strings.Contains(f.Detail, "::1") {
+				f.Severity = SevInfo
+			}
+		} else {
+			f.Severity = SevInfo
+		}
+
+	case "LISTENORPHAN":
+		exe := parseKV(f.Detail, "exe")
+		if strings.HasPrefix(exe, "/usr/local/") || strings.HasPrefix(exe, "/opt/") || strings.HasPrefix(exe, "/home/") {
+			f.Severity = SevLow
+		} else if strings.HasPrefix(exe, "/tmp/") || strings.HasPrefix(exe, "/dev/shm/") || strings.HasPrefix(exe, "/var/tmp/") {
+			f.Severity = SevCritical
+		} else {
+			allowed := false
+			for _, al := range listenOrphanAllowed {
+				if strings.Contains(exe, al) {
+					allowed = true
+					break
+				}
+			}
+			if allowed {
+				f.Severity = SevInfo
+			}
+		}
+
 	case "DELETED":
 		// If dpkg confirms the binary's package was upgraded, this is a
 		// stale process — not malware. Downgrade from CRITICAL to MEDIUM.
@@ -465,6 +735,17 @@ echo "===DNSCONF===" && cat /etc/resolv.conf 2>/dev/null | grep -v '^#' | grep -
 echo "===IPTABLES===" && iptables -L -n --line-numbers 2>/dev/null | grep -vE '^Chain|^num|^$|policy ACCEPT' | head -30
 echo "===FAILEDAUTH===" && count=0; lines=0; if command -v journalctl >/dev/null 2>&1; then lines=$(journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -ciE 'fail|invalid|refused'); fi; fcount=$(grep -ciE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null || echo 0); count=$((lines + fcount)); echo "TOTAL_FAILURES=$count"; journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -iE 'fail|invalid|refused' | tail -20; grep -iE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null | tail -20
 echo "===LOGCHECK===" && find /var/log -maxdepth 1 -type f -empty ! -name '*.1' ! -name '*.gz' ! -name '*.old' ! -name '*.xz' ! -name 'faillog' ! -name 'btmp' ! -name 'lastlog' 2>/dev/null | grep -vE '\-[0-9]{8}$'
+echo "===PKGVERIFY===" && if command -v dpkg >/dev/null 2>&1; then dpkg -V 2>/dev/null | grep -vE '^..5' | head -50; dpkg -V 2>/dev/null | grep -E '^..5' | while IFS= read -r line; do file=$(echo "$line" | awk '{print $NF}'); conffile=false; pkg=$(dpkg -S "$file" 2>/dev/null | head -1 | cut -d: -f1); [ -n "$pkg" ] && dpkg-query -s "$pkg" 2>/dev/null | grep -q "^Conffiles:" && dpkg-query -s "$pkg" 2>/dev/null | sed -n '/^Conffiles:/,/^[^ ]/p' | grep -q " $file " && conffile=true; $conffile && echo "${line} [CONFFILE]" || echo "${line} [HASH_MISMATCH]"; done; elif command -v rpm >/dev/null 2>&1; then rpm -Va --nomtime --noconfig 2>/dev/null | grep -E '^..5' | while IFS= read -r line; do file=$(echo "$line" | awk '{print $NF}'); echo "${line} [HASH_MISMATCH]"; done | head -50; elif command -v apk >/dev/null 2>&1; then apk verify 2>&1 | grep -i 'checksum' | head -50; fi
+echo "===PROCTREE===" && for pid in /proc/[0-9]*/exe; do p=${pid%/exe}; p=${p#/proc/}; [ -r "/proc/$p/status" ] || continue; exe=$(readlink "/proc/$p/exe" 2>/dev/null | sed 's/ (deleted)//') || continue; [ -z "$exe" ] && continue; ppid=$(awk '/^PPid:/{print $2}' "/proc/$p/status" 2>/dev/null); pexe=$(readlink "/proc/$ppid/exe" 2>/dev/null | sed 's/ (deleted)//' 2>/dev/null); cmdline=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null); uid=$(awk '/^Uid:/{print $2}' "/proc/$p/status" 2>/dev/null); echo "pid=$p ppid=$ppid uid=$uid exe=$exe pexe=$pexe cmd=$cmdline"; done 2>/dev/null
+echo "===PROCMASQ===" && for pid in /proc/[0-9]*/exe; do p=${pid%/exe}; p=${p#/proc/}; exe=$(readlink "/proc/$p/exe" 2>/dev/null | sed 's/ (deleted)//') || continue; [ -z "$exe" ] && continue; cmdline=$(cat "/proc/$p/cmdline" 2>/dev/null | tr '\0' ' ' | head -c 500); [ -z "$cmdline" ] && continue; cmd0=$(echo "$cmdline" | awk '{print $1}'); exebase=$(basename "$exe"); cmd0base=$(basename "$cmd0" 2>/dev/null); if [ "$cmd0base" != "$exebase" ]; then case "$cmd0" in \[*\]) ;; -bash|-sh|-zsh|-dash) ;; *) echo "pid=$p exe=$exe cmdline=$cmdline"; ;; esac; fi; done 2>/dev/null
+echo "===ORPHANBIN===" && { for dir in /usr/bin /usr/sbin /usr/local/bin /usr/local/sbin; do [ -d "$dir" ] && find "$dir" -maxdepth 1 -type f 2>/dev/null; done; } | while IFS= read -r f; do if command -v dpkg >/dev/null 2>&1; then dpkg -S "$f" >/dev/null 2>&1 && continue; elif command -v rpm >/dev/null 2>&1; then rpm -qf "$f" >/dev/null 2>&1 && continue; fi; ls -la "$f" 2>/dev/null; done | head -80
+echo "===PROCMEM===" && for pid in /proc/[0-9]*/maps; do p=${pid%/maps}; p=${p#/proc/}; [ -r "/proc/$p/maps" ] || continue; anon=$(grep -c 'rwxp.*00000000 00:00 0' "/proc/$p/maps" 2>/dev/null); [ "$anon" -gt 0 ] 2>/dev/null && exe=$(readlink "/proc/$p/exe" 2>/dev/null | sed 's/ (deleted)//'); echo "pid=$p exe=$exe anon_rwx=$anon"; done 2>/dev/null | awk -F'anon_rwx=' '$2 > 0 {print}'
+echo "===PROCENV===" && for pid in /proc/[0-9]*/environ; do p=${pid%/environ}; p=${p#/proc/}; [ -r "/proc/$p/environ" ] || continue; env=$(tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null); preload=$(echo "$env" | grep '^LD_PRELOAD=' 2>/dev/null); [ -n "$preload" ] && exe=$(readlink "/proc/$p/exe" 2>/dev/null) && echo "pid=$p exe=$exe $preload"; done 2>/dev/null
+echo "===LOGGAP===" && for log in /var/log/auth.log /var/log/secure /var/log/syslog /var/log/messages; do [ -f "$log" ] || continue; lines=$(wc -l < "$log"); [ "$lines" -lt 10 ] && continue; first_ts=$(head -1 "$log" | awk '{print $1,$2,$3}'); last_ts=$(tail -1 "$log" | awk '{print $1,$2,$3}'); first_e=$(date -d "$first_ts" +%s 2>/dev/null); last_e=$(date -d "$last_ts" +%s 2>/dev/null); [ -z "$first_e" ] || [ -z "$last_e" ] && continue; span=$((last_e - first_e)); expected_rate=$((lines * 86400 / (span + 1))); [ "$expected_rate" -gt 0 ] && echo "$log: lines=$lines span_hours=$((span/3600)) rate=${expected_rate}/day"; awk 'NR<=200 || NR>(LINES-200){print}' LINES="$lines" "$log" 2>/dev/null | while IFS= read -r line; do ts=$(echo "$line" | awk '{print $1,$2,$3}'); epoch=$(date -d "$ts" +%s 2>/dev/null) || continue; [ -z "$epoch" ] && continue; if [ -n "$prev_epoch" ]; then gap=$((epoch - prev_epoch)); [ "$gap" -gt 3600 ] && echo "$log: gap=${gap}s (~$((gap/3600))h) after=$prev_ts"; fi; prev_epoch=$epoch; prev_ts="$ts"; done; done 2>/dev/null | head -30
+echo "===ORPHANSVC===" && systemctl list-unit-files --type=service --state=enabled --no-pager --no-legend 2>/dev/null | awk '{print $1}' | while IFS= read -r svc; do path=$(systemctl show -p FragmentPath "$svc" 2>/dev/null | cut -d= -f2-); [ -z "$path" ] || [ ! -f "$path" ] && continue; owned=false; if command -v dpkg >/dev/null 2>&1; then dpkg -S "$path" >/dev/null 2>&1 && owned=true; elif command -v rpm >/dev/null 2>&1; then rpm -qf "$path" >/dev/null 2>&1 && owned=true; fi; $owned || echo "$svc path=$path"; done 2>/dev/null | head -30
+echo "===USERACCT===" && while IFS=: read -r user _ uid gid _ home shell; do [ "$uid" -ge 1000 ] 2>/dev/null || [ "$uid" = "0" ] || continue; [ "$shell" = "/usr/sbin/nologin" ] || [ "$shell" = "/bin/false" ] || [ "$shell" = "/sbin/nologin" ] && continue; lastlog_line=$(lastlog -u "$user" 2>/dev/null | tail -1); never_logged=$(echo "$lastlog_line" | grep -c 'Never logged in'); has_home=false; [ -d "$home" ] && has_home=true; sudoer=false; grep -rq "^$user " /etc/sudoers /etc/sudoers.d/ 2>/dev/null && sudoer=true; echo "user=$user uid=$uid home_exists=$has_home never_logged=$never_logged sudoer=$sudoer shell=$shell"; done < /etc/passwd 2>/dev/null; echo "---SUDOERS_D---"; for f in /etc/sudoers.d/*; do [ -f "$f" ] || continue; owned=false; if command -v dpkg >/dev/null 2>&1; then dpkg -S "$f" >/dev/null 2>&1 && owned=true; elif command -v rpm >/dev/null 2>&1; then rpm -qf "$f" >/dev/null 2>&1 && owned=true; fi; $owned || echo "$f [UNPACKAGED]"; done 2>/dev/null
+echo "===DNSLEAK===" && configured_dns=$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | sort -u); ss -unp 2>/dev/null | grep ':53 ' | while IFS= read -r line; do remote=$(echo "$line" | awk '{print $5}' | sed 's/:53$//'); match=false; for dns in $configured_dns; do [ "$remote" = "$dns" ] && match=true && break; done; $match || echo "$line [NON_CONFIGURED_DNS=$remote]"; done 2>/dev/null
+echo "===LISTENORPHAN===" && ss -tlnp 2>/dev/null | tail -n +2 | while IFS= read -r line; do prog=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+'); pid=$(echo "$line" | grep -oP 'pid=\K[0-9]+'); [ -z "$pid" ] && continue; exe=$(readlink "/proc/$pid/exe" 2>/dev/null | sed 's/ (deleted)//'); [ -z "$exe" ] && continue; owned=false; if command -v dpkg >/dev/null 2>&1; then dpkg -S "$exe" >/dev/null 2>&1 && owned=true; elif command -v rpm >/dev/null 2>&1; then rpm -qf "$exe" >/dev/null 2>&1 && owned=true; fi; $owned || echo "port=$(echo "$line" | awk '{print $4}') exe=$exe pid=$pid prog=$prog"; done 2>/dev/null
 echo "===DONE==="
 `
 
@@ -531,6 +812,17 @@ var sectionMarkers = map[string]string{
 	"===IPTABLES===":     "IPTABLES",
 	"===FAILEDAUTH===":   "FAILEDAUTH",
 	"===LOGCHECK===":     "LOGCHECK",
+	"===PKGVERIFY===":    "PKGVERIFY",
+	"===PROCTREE===":     "PROCTREE",
+	"===PROCMASQ===":     "PROCMASQ",
+	"===ORPHANBIN===":    "ORPHANBIN",
+	"===PROCMEM===":      "PROCMEM",
+	"===PROCENV===":      "PROCENV",
+	"===LOGGAP===":       "LOGGAP",
+	"===ORPHANSVC===":    "ORPHANSVC",
+	"===USERACCT===":     "USERACCT",
+	"===DNSLEAK===":      "DNSLEAK",
+	"===LISTENORPHAN===": "LISTENORPHAN",
 	"===DONE===":         "",
 }
 
@@ -894,7 +1186,7 @@ func triageContainers(client *ssh.Client, sudoPassword string, isRoot bool, ip s
 			}
 		} else {
 			parsed := parseFindings(execOut, ctSectionMarkers)
-			
+
 			// POST-PROCESS for CT_DOCKERSOCK allowlist
 			nameLower := strings.ToLower(ct.Name)
 			imageLower := strings.ToLower(ct.Image)
