@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -142,6 +143,19 @@ var dangerousCaps = map[string]bool{
 	"NET_ADMIN": true,
 }
 
+var dockerSockAllowlist = []string{
+	"homepage", "gethomepage/homepage",
+	"deunhealth", "qmcgaw/deunhealth",
+	"watchtower", "containrrr/watchtower",
+	"portainer", "portainer/portainer",
+	"dockge", "louislam/dockge",
+	"docker-socket-proxy", "tecnativa/docker-socket-proxy",
+	"diun", "crazymax/diun",
+	"autoheal", "willfarrell/autoheal",
+}
+
+var containerCronRegex = regexp.MustCompile(`(/api/v[0-9]+/cron/|wget .* http://[a-z_-]+:[0-9]+/)`)
+
 // Kernel taint bit descriptions (from kernel docs)
 var taintFlags = map[int]string{
 	0:  "proprietary module",
@@ -192,7 +206,11 @@ func analyzeFinding(f *Finding) {
 	case "TAINTED":
 		raw := strings.TrimSpace(f.Detail)
 		// Extract the numeric taint value (may have [KNOWN_DRIVERS=...] appended)
-		taintStr := strings.Fields(raw)[0]
+		fields := strings.Fields(raw)
+		if len(fields) == 0 {
+			break
+		}
+		taintStr := fields[0]
 		if taintStr != "0" {
 			if val, err := strconv.Atoi(taintStr); err == nil {
 				var flags []string
@@ -320,11 +338,16 @@ func analyzeFinding(f *Finding) {
 			"dpkg", "logrotate", "man-db", "popularity-contest",
 			"update-notifier-common", "google-chrome",
 			"0hourly", "0anacron", "raid-check",
+			"certbot", "exim4", "exim4-base", "anacron",
+			"bsdmainutils", "mlocate", "plocate",
 		} {
 			if strings.Contains(lower, standard) {
 				f.Severity = SevInfo
 				break
 			}
+		}
+		if containerCronRegex.MatchString(lower) {
+			f.Severity = SevInfo
 		}
 		// Alpine default periodic crontabs (present in every Alpine container)
 		if strings.Contains(f.Detail, "run-parts /etc/periodic/") {
@@ -336,19 +359,8 @@ func analyzeFinding(f *Finding) {
 		}
 
 	case "RCLOCAL":
-		// Known third-party services installed via packages are not persistence IoCs
-		lower := strings.ToLower(f.Detail)
-		for _, known := range []string{
-			"docker", "filebeat", "wazuh", "elasticsearch", "kibana",
-			"logstash", "nginx", "mysql", "mariadb", "postgresql",
-			"redis", "containerd", "snapd", "tailscale", "netbird",
-			"wireguard", "zerotier", "openvpn", "fail2ban", "certbot",
-			"grafana", "prometheus", "telegraf", "zabbix", "ntp", "chrony",
-		} {
-			if strings.Contains(lower, known) {
-				f.Severity = SevInfo
-				break
-			}
+		if strings.Contains(f.Detail, "[PKG_OWNED]") {
+			f.Severity = SevInfo
 		}
 
 	case "LOGCHECK":
@@ -438,7 +450,7 @@ echo "===CONTAINERENV===" && cat /proc/1/cgroup 2>/dev/null | head -5; [ -f /.do
 echo "===TIMERS===" && systemctl list-timers --no-pager --no-legend 2>/dev/null
 echo "===SHELLINIT===" && for u in /root /home/*; do for rc in .bashrc .bash_profile .profile; do [ -f "$u/$rc" ] && grep -nE '(curl |wget |nc |ncat |python|perl -e|ruby -e|base64|eval |exec )' "$u/$rc" 2>/dev/null | sed "s|^|$u/$rc:|"; done; done; find /etc/profile.d/ -type f -newer /etc/passwd 2>/dev/null
 echo "===LDPRELOAD===" && cat /etc/ld.so.preload 2>/dev/null
-echo "===RCLOCAL===" && cat /etc/rc.local 2>/dev/null | grep -v '^#' | grep -v '^$' | grep -v '^exit 0'; ls /etc/init.d/ 2>/dev/null | grep -vE '^(README|skeleton|rc|rcS|single|.*\.dpkg|apparmor|apport|console-setup\.sh|cron|cryptdisks|cryptdisks-early|dbus|grub-common|hwclock\.sh|irqbalance|iscsid|keyboard-setup\.sh|kmod|lvm2.*|mdadm.*|nfs-common|open-iscsi|open-vm-tools|plymouth|plymouth-log|procps|rpcbind|rsync|rsyslog|screen-cleanup|ssh|sudo|sysstat|ubuntu-fan|udev|ufw|unattended-upgrades|uuidd|x11-common)$'
+echo "===RCLOCAL===" && cat /etc/rc.local 2>/dev/null | grep -v '^#' | grep -v '^$' | grep -v '^exit 0'; for f in /etc/init.d/*; do [ -f "$f" ] || continue; base=$(basename "$f"); case "$base" in README|skeleton|rc|rcS|single|*.dpkg*) continue ;; esac; if command -v dpkg >/dev/null 2>&1; then dpkg -S "$f" >/dev/null 2>&1 && echo "$f [PKG_OWNED]" || echo "$f"; elif command -v rpm >/dev/null 2>&1; then rpm -qf "$f" >/dev/null 2>&1 && echo "$f [PKG_OWNED]" || echo "$f"; else echo "$f"; fi; done
 echo "===PAM===" && pam_check() { for f in "$@"; do if command -v rpm >/dev/null 2>&1; then rpm -qf "$f" >/dev/null 2>&1 && echo "$f [PKG_OWNED]" || echo "$f"; elif command -v dpkg >/dev/null 2>&1; then dpkg -S "$f" >/dev/null 2>&1 && echo "$f [PKG_OWNED]" || echo "$f"; else echo "$f"; fi; done; }; pam_check $(find /etc/pam.d/ -type f -newer /etc/passwd 2>/dev/null) $(find /lib/security/ /lib64/security/ /usr/lib/security/ /usr/lib64/security/ -name '*.so' -newer /etc/passwd -type f 2>/dev/null)
 echo "===ATJOBS===" && atq 2>/dev/null
 echo "===PROCHIDE===" && ps_count=$(ps aux 2>/dev/null | tail -n +2 | wc -l); proc_count=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l); echo "ps=$ps_count proc=$proc_count diff=$((proc_count - ps_count))"
@@ -451,7 +463,7 @@ echo "===SHADOWPERMS===" && ls -la /etc/shadow 2>/dev/null
 echo "===OUTBOUND===" && ss -tnp 2>/dev/null | grep ESTAB
 echo "===DNSCONF===" && cat /etc/resolv.conf 2>/dev/null | grep -v '^#' | grep -v '^$'
 echo "===IPTABLES===" && iptables -L -n --line-numbers 2>/dev/null | grep -vE '^Chain|^num|^$|policy ACCEPT' | head -30
-echo "===FAILEDAUTH===" && count=0; lines=""; if command -v journalctl >/dev/null 2>&1; then lines=$(journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -ciE 'fail|invalid|refused'); fi; fcount=$(grep -ciE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null || echo 0); count=$((lines + fcount)); echo "TOTAL_FAILURES=$count"; journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -iE 'fail|invalid|refused' | tail -20; grep -iE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null | tail -20
+echo "===FAILEDAUTH===" && count=0; lines=0; if command -v journalctl >/dev/null 2>&1; then lines=$(journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -ciE 'fail|invalid|refused'); fi; fcount=$(grep -ciE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null || echo 0); count=$((lines + fcount)); echo "TOTAL_FAILURES=$count"; journalctl -u sshd --since "24 hours ago" --no-pager 2>/dev/null | grep -iE 'fail|invalid|refused' | tail -20; grep -iE 'fail|invalid|refused' /var/log/auth.log 2>/dev/null | tail -20
 echo "===LOGCHECK===" && find /var/log -maxdepth 1 -type f -empty ! -name '*.1' ! -name '*.gz' ! -name '*.old' ! -name '*.xz' ! -name 'faillog' ! -name 'btmp' ! -name 'lastlog' 2>/dev/null | grep -vE '\-[0-9]{8}$'
 echo "===DONE==="
 `
@@ -818,6 +830,16 @@ func triageContainers(client *ssh.Client, sudoPassword string, isRoot bool, ip s
 			if src == "/var/run/docker.sock" || dst == "/var/run/docker.sock" {
 				sev = SevCritical
 				detail += " — DOCKER SOCKET: full host escape"
+
+				nameLower := strings.ToLower(ct.Name)
+				imageLower := strings.ToLower(ct.Image)
+				for _, allowed := range dockerSockAllowlist {
+					if strings.Contains(nameLower, allowed) || strings.Contains(imageLower, allowed) {
+						sev = SevMedium
+						detail += fmt.Sprintf(" (allowlisted: %s)", allowed)
+						break
+					}
+				}
 			} else if src == "/" {
 				sev = SevCritical
 				detail += " — HOST ROOT FILESYSTEM"
@@ -871,7 +893,24 @@ func triageContainers(client *ssh.Client, sudoPassword string, isRoot bool, ip s
 				}
 			}
 		} else {
-			cr.Findings = append(cr.Findings, parseFindings(execOut, ctSectionMarkers)...)
+			parsed := parseFindings(execOut, ctSectionMarkers)
+			
+			// POST-PROCESS for CT_DOCKERSOCK allowlist
+			nameLower := strings.ToLower(ct.Name)
+			imageLower := strings.ToLower(ct.Image)
+			for i := range parsed {
+				if parsed[i].Check == "DOCKERSOCK" && parsed[i].Severity == SevCritical {
+					for _, allowed := range dockerSockAllowlist {
+						if strings.Contains(nameLower, allowed) || strings.Contains(imageLower, allowed) {
+							parsed[i].Severity = SevMedium
+							parsed[i].Detail += fmt.Sprintf(" (allowlisted: %s)", allowed)
+							break
+						}
+					}
+				}
+			}
+
+			cr.Findings = append(cr.Findings, parsed...)
 		}
 
 		results = append(results, cr)
